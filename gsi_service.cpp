@@ -36,6 +36,7 @@
 #include <libdm/dm.h>
 #include <libfiemap_writer/fiemap_writer.h>
 #include <logwrap/logwrap.h>
+#include <private/android_filesystem_config.h>
 
 #include "file_paths.h"
 #include "libgsi_private.h"
@@ -47,6 +48,8 @@ using namespace std::literals;
 using namespace android::dm;
 using namespace android::fs_mgr;
 using namespace android::fiemap_writer;
+using android::base::StringPrintf;
+using android::base::unique_fd;
 
 static constexpr char kUserdataDevice[] = "/dev/block/by-name/userdata";
 
@@ -75,8 +78,21 @@ GsiService::~GsiService() {
     PostInstallCleanup();
 }
 
+#define ENFORCE_SYSTEM                          \
+    do {                                        \
+        binder::Status status = CheckUid();     \
+        if (!status.isOk()) return status;      \
+    } while (0)
+
+#define ENFORCE_SYSTEM_OR_SHELL                                         \
+    do {                                                                \
+        binder::Status status = CheckUid(AccessLevel::SystemOrShell);   \
+        if (!status.isOk()) return status;                              \
+    } while (0)
+
 binder::Status GsiService::startGsiInstall(int64_t gsiSize, int64_t userdataSize, bool wipeUserdata,
                                            int* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     // Make sure any interrupted installations are cleaned up.
@@ -100,6 +116,7 @@ binder::Status GsiService::startGsiInstall(int64_t gsiSize, int64_t userdataSize
 
 binder::Status GsiService::commitGsiChunkFromStream(const android::os::ParcelFileDescriptor& stream,
                                                     int64_t bytes, bool* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = CommitGsiChunk(stream.get(), bytes);
@@ -130,6 +147,7 @@ void GsiService::UpdateProgress(int status, int64_t bytes_processed) {
 }
 
 binder::Status GsiService::getInstallProgress(::android::gsi::GsiProgress* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(progress_lock_);
 
     *_aidl_return = progress_;
@@ -138,6 +156,7 @@ binder::Status GsiService::getInstallProgress(::android::gsi::GsiProgress* _aidl
 
 binder::Status GsiService::commitGsiChunkFromMemory(const std::vector<uint8_t>& bytes,
                                                     bool* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = CommitGsiChunk(bytes.data(), bytes.size());
@@ -145,6 +164,7 @@ binder::Status GsiService::commitGsiChunkFromMemory(const std::vector<uint8_t>& 
 }
 
 binder::Status GsiService::setGsiBootable(int* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     if (installing_) {
@@ -156,6 +176,7 @@ binder::Status GsiService::setGsiBootable(int* _aidl_return) {
 }
 
 binder::Status GsiService::removeGsiInstall(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_SHELL;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     // Just in case an install was left hanging.
@@ -171,6 +192,7 @@ binder::Status GsiService::removeGsiInstall(bool* _aidl_return) {
 }
 
 binder::Status GsiService::disableGsiInstall(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_SHELL;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = DisableGsiInstall();
@@ -178,6 +200,7 @@ binder::Status GsiService::disableGsiInstall(bool* _aidl_return) {
 }
 
 binder::Status GsiService::isGsiRunning(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_SHELL;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = IsGsiRunning();
@@ -185,6 +208,7 @@ binder::Status GsiService::isGsiRunning(bool* _aidl_return) {
 }
 
 binder::Status GsiService::isGsiInstalled(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_SHELL;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = IsGsiInstalled();
@@ -192,6 +216,7 @@ binder::Status GsiService::isGsiInstalled(bool* _aidl_return) {
 }
 
 binder::Status GsiService::isGsiInstallInProgress(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_SHELL;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     *_aidl_return = installing_;
@@ -199,6 +224,7 @@ binder::Status GsiService::isGsiInstallInProgress(bool* _aidl_return) {
 }
 
 binder::Status GsiService::cancelGsiInstall(bool* _aidl_return) {
+    ENFORCE_SYSTEM;
     std::lock_guard<std::mutex> guard(main_lock_);
 
     if (!installing_) {
@@ -215,6 +241,7 @@ binder::Status GsiService::cancelGsiInstall(bool* _aidl_return) {
 }
 
 binder::Status GsiService::getUserdataImageSize(int64_t* _aidl_return) {
+    ENFORCE_SYSTEM;
     *_aidl_return = -1;
 
     if (installing_) {
@@ -222,7 +249,7 @@ binder::Status GsiService::getUserdataImageSize(int64_t* _aidl_return) {
         *_aidl_return = userdata_size_;
     } else if (IsGsiRunning()) {
         // :TODO: libdm
-        android::base::unique_fd fd(open(kUserdataDevice, O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+        unique_fd fd(open(kUserdataDevice, O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
         if (fd < 0) {
             PLOG(ERROR) << "open " << kUserdataDevice;
             return binder::Status::ok();
@@ -250,6 +277,24 @@ binder::Status GsiService::getUserdataImageSize(int64_t* _aidl_return) {
     return binder::Status::ok();
 }
 
+binder::Status GsiService::CheckUid(AccessLevel level) {
+    std::vector<uid_t> allowed_uids{AID_ROOT, AID_SYSTEM};
+    if (level == AccessLevel::SystemOrShell) {
+        allowed_uids.push_back(AID_SHELL);
+    }
+
+    uid_t uid = IPCThreadState::self()->getCallingUid();
+    for (const auto& allowed_uid : allowed_uids) {
+        if (allowed_uid == uid) {
+            return binder::Status::ok();
+        }
+    }
+
+    auto message = StringPrintf("UID %d is not allowed", uid);
+    return binder::Status::fromExceptionCode(binder::Status::EX_SECURITY,
+                                             String8(message.c_str()));
+}
+
 void GsiService::PostInstallCleanup() {
     // This must be closed before unmapping partitions.
     system_fd_ = {};
@@ -266,9 +311,13 @@ void GsiService::PostInstallCleanup() {
 }
 
 int GsiService::StartInstall(int64_t gsi_size, int64_t userdata_size, bool wipe_userdata) {
+    userdata_block_size_ = 0;
+    system_block_size_ = 0;
     gsi_size_ = gsi_size;
     userdata_size_ = userdata_size;
     wipe_userdata_ = wipe_userdata;
+    can_use_devicemapper_ = false;
+    gsi_bytes_written_ = 0;
 
     if (int status = PerformSanityChecks()) {
         return status;
@@ -280,18 +329,23 @@ int GsiService::StartInstall(int64_t gsi_size, int64_t userdata_size, bool wipe_
         return INSTALL_ERROR_GENERIC;
     }
 
-    // Map system_gsi so we can write to it.
+    // If there is a device-mapper node wrapping the block device, then we're
+    // able to create another node around it; the dm layer does not carry the
+    // exclusion lock down the stack when a mount occurs.
+    //
+    // If there is no intermediate device-mapper node, then userdata cannot be
+    // opened writable due to sepolicy and exclusivity of having a mounted
+    // filesystem. This should only happen on devices with no encryption, or
+    // devices with FBE and no metadata encryption. For these cases it suffices
+    // to perform normal file writes to /data/gsi (which is unencrypted).
     std::string block_device;
-    if (!CreateLogicalPartition(kUserdataDevice, *metadata_.get(), "system_gsi", true, kDmTimeout,
-                                &block_device)) {
-        LOG(ERROR) << "Error creating device-mapper node for system_gsi";
+    if (!FiemapWriter::GetBlockDeviceForFile(kSystemFile, &block_device, &can_use_devicemapper_)) {
         return INSTALL_ERROR_GENERIC;
     }
 
-    static const int kOpenFlags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
-    system_fd_.reset(open(block_device.c_str(), kOpenFlags));
+    // Map system_gsi so we can write to it.
+    system_fd_ = OpenPartition("system_gsi");
     if (system_fd_ < 0) {
-        PLOG(ERROR) << "could not open " << block_device;
         return INSTALL_ERROR_GENERIC;
     }
 
@@ -358,9 +412,6 @@ int GsiService::PreallocateFiles() {
     }
 
     UpdateProgress(STATUS_COMPLETE, 0);
-
-    // We're ready to start streaming data in.
-    gsi_bytes_written_ = 0;
     return INSTALL_OK;
 }
 
@@ -440,6 +491,27 @@ fiemap_writer::FiemapUniquePtr GsiService::CreateFiemapWriter(const std::string&
         return nullptr;
     }
     return file;
+}
+
+unique_fd GsiService::OpenPartition(const std::string& name) {
+    std::string path;
+    if (can_use_devicemapper_) {
+        if (!CreateLogicalPartition(kUserdataDevice, *metadata_.get(), name, true, kDmTimeout,
+                                    &path)) {
+            LOG(ERROR) << "Error creating device-mapper node for " << name;
+            return {};
+        }
+    } else {
+        path = "/data/gsi/" + name + ".img";
+    }
+
+    static const int kOpenFlags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
+
+    unique_fd fd(open(path.c_str(), kOpenFlags));
+    if (fd < 0) {
+        PLOG(ERROR) << "could not open " << path;
+    }
+    return fd;
 }
 
 bool GsiService::CommitGsiChunk(int stream_fd, int64_t bytes) {
@@ -668,23 +740,15 @@ bool GsiService::CreateMetadataFile(const LpMetadata& metadata) {
 }
 
 bool GsiService::FormatUserdata() {
-    std::string block_device;
-    if (!CreateLogicalPartition(kUserdataDevice, *metadata_.get(), "userdata_gsi", true, kDmTimeout,
-                                &block_device)) {
-        LOG(ERROR) << "Error creating device-mapper node for userdata_gsi";
-        return false;
-    }
-
-    android::base::unique_fd fd(open(block_device.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC));
+    unique_fd fd = OpenPartition("userdata_gsi");
     if (fd < 0) {
-        PLOG(ERROR) << "open " << block_device;
         return false;
     }
 
     // libcutils checks the first 4K, no matter the block size.
     std::string zeroes(4096, 0);
     if (!android::base::WriteFully(fd, zeroes.data(), zeroes.size())) {
-        PLOG(ERROR) << "write " << block_device;
+        PLOG(ERROR) << "write userdata_gsi";
         return false;
     }
     return true;
