@@ -310,7 +310,7 @@ binder::Status GsiService::getGsiBootStatus(int* _aidl_return) {
         // disabled immediately upon reading the one_shot_boot file. However,
         // we still want to return SINGLE_BOOT, because it makes the
         // transition clearer to the user.
-        if (IsGsiRunning() && single_boot) {
+        if (single_boot) {
             *_aidl_return = BOOT_STATUS_SINGLE_BOOT;
         } else {
             *_aidl_return = BOOT_STATUS_DISABLED;
@@ -888,6 +888,12 @@ int GsiService::ReenableGsi(bool one_shot) {
         return INSTALL_ERROR_GENERIC;
     }
 
+    if (IsGsiRunning()) {
+        if (!SetBootMode(one_shot) || !CreateInstallStatusFile()) {
+            return INSTALL_ERROR_GENERIC;
+        }
+        return INSTALL_OK;
+    }
     // Note: this metadata is only used to recover the original partition sizes.
     // We do not trust the extent information, which will get rebuilt later.
     auto old_metadata = ReadFromImageFile(kGsiLpMetadataFile);
