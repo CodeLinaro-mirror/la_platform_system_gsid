@@ -310,7 +310,7 @@ binder::Status GsiService::getGsiBootStatus(int* _aidl_return) {
         // disabled immediately upon reading the one_shot_boot file. However,
         // we still want to return SINGLE_BOOT, because it makes the
         // transition clearer to the user.
-        if (IsGsiRunning() && single_boot) {
+        if (single_boot) {
             *_aidl_return = BOOT_STATUS_SINGLE_BOOT;
         } else {
             *_aidl_return = BOOT_STATUS_DISABLED;
@@ -481,7 +481,7 @@ int GsiService::StartInstall(const GsiInstallParams& params) {
     userdata_block_size_ = 0;
     system_block_size_ = 0;
     gsi_size_ = params.gsiSize;
-    userdata_size_ = params.userdataSize;
+    userdata_size_ = (params.userdataSize) ? params.userdataSize : kDefaultUserdataSize;
     wipe_userdata_ = params.wipeUserdata;
     can_use_devicemapper_ = false;
     gsi_bytes_written_ = 0;
@@ -626,10 +626,6 @@ int GsiService::PreallocateUserdata() {
     int error;
     std::unique_ptr<SplitFiemap> userdata_image;
     if (wipe_userdata_ || access(userdata_gsi_path_.c_str(), F_OK)) {
-        if (!userdata_size_) {
-            userdata_size_ = kDefaultUserdataSize;
-        }
-
         StartAsyncOperation("create userdata", userdata_size_);
         userdata_image = CreateFiemapWriter(userdata_gsi_path_, userdata_size_, &error);
         if (!userdata_image) {
@@ -888,6 +884,12 @@ int GsiService::ReenableGsi(bool one_shot) {
         return INSTALL_ERROR_GENERIC;
     }
 
+    if (IsGsiRunning()) {
+        if (!SetBootMode(one_shot) || !CreateInstallStatusFile()) {
+            return INSTALL_ERROR_GENERIC;
+        }
+        return INSTALL_OK;
+    }
     // Note: this metadata is only used to recover the original partition sizes.
     // We do not trust the extent information, which will get rebuilt later.
     auto old_metadata = ReadFromImageFile(kGsiLpMetadataFile);
