@@ -21,9 +21,13 @@ namespace gsi {
 
 static constexpr char kDefaultGsiImageFolder[] = "/data/gsi/dsu/";
 
-static constexpr char kGsiLpMetadataFile[] = "/metadata/gsi/dsu/lp_metadata";
-static constexpr char kGsiOneShotBootFile[] = "/metadata/gsi/dsu/one_shot_boot";
-static constexpr char kGsiInstallDirFile[] = "/metadata/gsi/dsu/install_dir";
+static constexpr char kGsiDataFolder[] = "/data/gsi/";
+static constexpr char kUserdataDevice[] = "/dev/block/by-name/userdata";
+
+static constexpr char kGsiMetadataFolder[] = "/metadata/gsi";
+static constexpr char kGsiLpMetadataFile[] = "/metadata/gsi/lp_metadata";
+static constexpr char kGsiOneShotBootFile[] = "/metadata/gsi/one_shot_boot";
+static constexpr char kGsiInstallDirFile[] = "/metadata/gsi/install_dir";
 
 // This file can contain the following values:
 //   [int]      - boot attempt counter, starting from 0
