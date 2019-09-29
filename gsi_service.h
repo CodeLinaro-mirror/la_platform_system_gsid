@@ -24,8 +24,9 @@
 
 #include <android-base/unique_fd.h>
 #include <android/gsi/BnGsiService.h>
+#include <android/gsi/BnGsid.h>
 #include <binder/BinderService.h>
-#include <libfiemap_writer/split_fiemap_writer.h>
+#include <libfiemap/split_fiemap_writer.h>
 #include <liblp/builder.h>
 #include "libgsi/libgsi.h"
 
@@ -34,58 +35,63 @@
 namespace android {
 namespace gsi {
 
-class GsiService : public BinderService<GsiService>, public BnGsiService {
+class Gsid : public BinderService<Gsid>, public BnGsid {
   public:
     static void Register();
+    static char const* getServiceName() { return kGsiServiceName; }
 
-    GsiService();
+    binder::Status getClient(android::sp<IGsiService>* _aidl_return) override;
+
+  private:
+    friend class GsiService;
+    friend class ImageService;
+
+    std::mutex& lock() { return lock_; }
+
+    std::mutex lock_;
+};
+
+class GsiService : public BinderService<GsiService>, public BnGsiService {
+  public:
     ~GsiService() override;
 
-    binder::Status startGsiInstall(int64_t gsiSize, int64_t userdataSize, bool wipeUserdata,
-                                   int* _aidl_return) override;
+    static android::sp<IGsiService> Get(Gsid* parent);
+
     binder::Status beginGsiInstall(const GsiInstallParams& params, int* _aidl_return) override;
     binder::Status commitGsiChunkFromStream(const ::android::os::ParcelFileDescriptor& stream,
                                             int64_t bytes, bool* _aidl_return) override;
     binder::Status getInstallProgress(::android::gsi::GsiProgress* _aidl_return) override;
-    binder::Status commitGsiChunkFromMemory(const ::std::vector<uint8_t>& bytes,
-                                            bool* _aidl_return) override;
+    binder::Status setGsiAshmem(const ::android::os::ParcelFileDescriptor& ashmem, int64_t size,
+                                bool* _aidl_return) override;
+    binder::Status commitGsiChunkFromAshmem(int64_t bytes, bool* _aidl_return) override;
     binder::Status cancelGsiInstall(bool* _aidl_return) override;
-    binder::Status setGsiBootable(bool oneShot, int* _aidl_return) override;
+    binder::Status enableGsi(bool oneShot, int* _aidl_return) override;
     binder::Status isGsiEnabled(bool* _aidl_return) override;
-    binder::Status removeGsiInstall(bool* _aidl_return) override;
-    binder::Status disableGsiInstall(bool* _aidl_return) override;
-    binder::Status isGsiRunning(bool* _aidl_return) override;
+    binder::Status removeGsi(bool* _aidl_return) override;
+    binder::Status disableGsi(bool* _aidl_return) override;
     binder::Status isGsiInstalled(bool* _aidl_return) override;
+    binder::Status isGsiRunning(bool* _aidl_return) override;
     binder::Status isGsiInstallInProgress(bool* _aidl_return) override;
-    binder::Status getUserdataImageSize(int64_t* _aidl_return) override;
-    binder::Status getGsiBootStatus(int* _aidl_return) override;
     binder::Status getInstalledGsiImageDir(std::string* _aidl_return) override;
     binder::Status wipeGsiUserdata(int* _aidl_return) override;
+    binder::Status openImageService(const std::string& prefix,
+                                    android::sp<IImageService>* _aidl_return) override;
 
     // This is in GsiService, rather than GsiInstaller, since we need to access
     // it outside of the main lock which protects the unique_ptr.
     void StartAsyncOperation(const std::string& step, int64_t total_bytes);
     void UpdateProgress(int status, int64_t bytes_processed);
 
-    static char const* getServiceName() { return kGsiServiceName; }
-
     // Helper methods for GsiInstaller.
-    static std::string GetImagePath(const std::string& image_dir, const std::string& name);
     static bool RemoveGsiFiles(const std::string& install_dir, bool wipeUserdata);
     bool should_abort() const { return should_abort_; }
+    Gsid* parent() const { return parent_.get(); }
 
     static void RunStartupTasks();
+    static std::string GetInstalledImageDir();
 
   private:
-    using LpMetadata = android::fs_mgr::LpMetadata;
-    using MetadataBuilder = android::fs_mgr::MetadataBuilder;
-    using SplitFiemap = android::fiemap_writer::SplitFiemap;
-
-    struct Image {
-        std::unique_ptr<SplitFiemap> writer;
-        uint64_t actual_size;
-    };
-
+    GsiService(Gsid* parent);
     int ValidateInstallParams(GsiInstallParams* params);
     bool DisableGsiInstall();
     int ReenableGsi(bool one_shot);
@@ -93,10 +99,9 @@ class GsiService : public BinderService<GsiService>, public BnGsiService {
     enum class AccessLevel { System, SystemOrShell };
     binder::Status CheckUid(AccessLevel level = AccessLevel::System);
 
-    static std::string GetInstalledImagePath(const std::string& name);
-    static std::string GetInstalledImageDir();
+    static android::wp<GsiService> sInstance;
 
-    std::mutex main_lock_;
+    android::sp<Gsid> parent_;
     std::unique_ptr<GsiInstaller> installer_;
 
     // These are initialized or set in StartInstall().

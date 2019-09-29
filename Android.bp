@@ -78,40 +78,14 @@ cc_binary {
     ],
     static_libs: [
         "libdm",
-        "libfiemap_writer",
+        "libfiemap_passthrough",
     ],
     local_include_dirs: ["include"],
 }
 
-cc_test {
-    name: "gsi_boot_test",
-    shared_libs: [
-        "libbase",
-        "libcutils",
-        "libhardware",
-        "libhidlbase",
-        "libhidltransport",
-        "libhwbinder",
-        "liblog",
-        "libutils",
-    ],
-    static_libs: [
-        "libext4_utils",
-        "libfstab",
-        "android.hardware.weaver@1.0",
-    ],
-    srcs: [
-        "tests/boot_tests.cpp",
-    ],
-}
-
 aidl_interface {
     name: "gsi_aidl_interface",
-    srcs: [
-        "aidl/android/gsi/GsiInstallParams.aidl",
-        "aidl/android/gsi/GsiProgress.aidl",
-        "aidl/android/gsi/IGsiService.aidl",
-    ],
+    srcs: [":gsiservice_aidl"],
     local_include_dir: "aidl",
     backend: {
         ndk: {
@@ -125,6 +99,9 @@ filegroup {
     srcs: [
         "aidl/android/gsi/GsiInstallParams.aidl",
         "aidl/android/gsi/GsiProgress.aidl",
+        "aidl/android/gsi/IImageService.aidl",
+        "aidl/android/gsi/IGsid.aidl",
         "aidl/android/gsi/IGsiService.aidl",
+        "aidl/android/gsi/MappedImage.aidl",
     ],
 }

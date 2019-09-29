@@ -32,9 +32,11 @@
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android/gsi/BnImageService.h>
 #include <android/gsi/IGsiService.h>
 #include <ext4_utils/ext4_utils.h>
 #include <fs_mgr.h>
+#include <libfiemap/image_manager.h>
 #include <private/android_filesystem_config.h>
 
 #include "file_paths.h"
@@ -45,23 +47,48 @@ namespace gsi {
 
 using namespace std::literals;
 using namespace android::fs_mgr;
-using namespace android::fiemap_writer;
+using namespace android::fiemap;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 
-void GsiService::Register() {
-    auto ret = android::BinderService<GsiService>::publish();
+android::wp<GsiService> GsiService::sInstance;
+
+void Gsid::Register() {
+    auto ret = android::BinderService<Gsid>::publish();
     if (ret != android::OK) {
         LOG(FATAL) << "Could not register gsi service: " << ret;
     }
 }
 
-GsiService::GsiService() {
+binder::Status Gsid::getClient(android::sp<IGsiService>* _aidl_return) {
+    *_aidl_return = GsiService::Get(this);
+    return binder::Status::ok();
+}
+
+GsiService::GsiService(Gsid* parent) : parent_(parent) {
     progress_ = {};
     GsiInstaller::PostInstallCleanup();
 }
 
-GsiService::~GsiService() {}
+GsiService::~GsiService() {
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    if (sInstance == this) {
+        // No more consumers, gracefully shut down gsid.
+        exit(0);
+    }
+}
+
+android::sp<IGsiService> GsiService::Get(Gsid* parent) {
+    std::lock_guard<std::mutex> guard(parent->lock());
+
+    android::sp<GsiService> service = sInstance.promote();
+    if (!service) {
+        service = new GsiService(parent);
+        sInstance = service.get();
+    }
+    return service.get();
+}
 
 #define ENFORCE_SYSTEM                      \
     do {                                    \
@@ -75,19 +102,10 @@ GsiService::~GsiService() {}
         if (!status.isOk()) return status;                            \
     } while (0)
 
-binder::Status GsiService::startGsiInstall(int64_t gsiSize, int64_t userdataSize, bool wipeUserdata,
-                                           int* _aidl_return) {
-    GsiInstallParams params;
-    params.gsiSize = gsiSize;
-    params.userdataSize = userdataSize;
-    params.wipeUserdata = wipeUserdata;
-    return beginGsiInstall(params, _aidl_return);
-}
-
 binder::Status GsiService::beginGsiInstall(const GsiInstallParams& given_params,
                                            int* _aidl_return) {
     ENFORCE_SYSTEM;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     // Make sure any interrupted installations are cleaned up.
     installer_ = nullptr;
@@ -112,7 +130,7 @@ binder::Status GsiService::beginGsiInstall(const GsiInstallParams& given_params,
 binder::Status GsiService::commitGsiChunkFromStream(const android::os::ParcelFileDescriptor& stream,
                                                     int64_t bytes, bool* _aidl_return) {
     ENFORCE_SYSTEM;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     if (!installer_) {
         *_aidl_return = false;
@@ -151,22 +169,30 @@ binder::Status GsiService::getInstallProgress(::android::gsi::GsiProgress* _aidl
     return binder::Status::ok();
 }
 
-binder::Status GsiService::commitGsiChunkFromMemory(const std::vector<uint8_t>& bytes,
-                                                    bool* _aidl_return) {
+binder::Status GsiService::commitGsiChunkFromAshmem(int64_t bytes, bool* _aidl_return) {
     ENFORCE_SYSTEM;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     if (!installer_) {
         *_aidl_return = false;
         return binder::Status::ok();
     }
-
-    *_aidl_return = installer_->CommitGsiChunk(bytes.data(), bytes.size());
+    *_aidl_return = installer_->CommitGsiChunk(bytes);
     return binder::Status::ok();
 }
 
-binder::Status GsiService::setGsiBootable(bool one_shot, int* _aidl_return) {
-    std::lock_guard<std::mutex> guard(main_lock_);
+binder::Status GsiService::setGsiAshmem(const ::android::os::ParcelFileDescriptor& ashmem,
+                                        int64_t size, bool* _aidl_return) {
+    if (!installer_) {
+        *_aidl_return = false;
+        return binder::Status::ok();
+    }
+    *_aidl_return = installer_->MapAshmem(ashmem.get(), size);
+    return binder::Status::ok();
+}
+
+binder::Status GsiService::enableGsi(bool one_shot, int* _aidl_return) {
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     if (installer_) {
         ENFORCE_SYSTEM;
@@ -186,7 +212,7 @@ binder::Status GsiService::setGsiBootable(bool one_shot, int* _aidl_return) {
 
 binder::Status GsiService::isGsiEnabled(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
     std::string boot_key;
     if (!GetInstallStatus(&boot_key)) {
         *_aidl_return = false;
@@ -196,9 +222,9 @@ binder::Status GsiService::isGsiEnabled(bool* _aidl_return) {
     return binder::Status::ok();
 }
 
-binder::Status GsiService::removeGsiInstall(bool* _aidl_return) {
+binder::Status GsiService::removeGsi(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     // Just in case an install was left hanging.
     std::string install_dir;
@@ -217,9 +243,9 @@ binder::Status GsiService::removeGsiInstall(bool* _aidl_return) {
     return binder::Status::ok();
 }
 
-binder::Status GsiService::disableGsiInstall(bool* _aidl_return) {
+binder::Status GsiService::disableGsi(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     *_aidl_return = DisableGsiInstall();
     return binder::Status::ok();
@@ -227,7 +253,7 @@ binder::Status GsiService::disableGsiInstall(bool* _aidl_return) {
 
 binder::Status GsiService::isGsiRunning(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     *_aidl_return = IsGsiRunning();
     return binder::Status::ok();
@@ -235,7 +261,7 @@ binder::Status GsiService::isGsiRunning(bool* _aidl_return) {
 
 binder::Status GsiService::isGsiInstalled(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     *_aidl_return = IsGsiInstalled();
     return binder::Status::ok();
@@ -243,7 +269,7 @@ binder::Status GsiService::isGsiInstalled(bool* _aidl_return) {
 
 binder::Status GsiService::isGsiInstallInProgress(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     *_aidl_return = !!installer_;
     return binder::Status::ok();
@@ -252,7 +278,7 @@ binder::Status GsiService::isGsiInstallInProgress(bool* _aidl_return) {
 binder::Status GsiService::cancelGsiInstall(bool* _aidl_return) {
     ENFORCE_SYSTEM;
     should_abort_ = true;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     should_abort_ = false;
     installer_ = nullptr;
@@ -261,88 +287,9 @@ binder::Status GsiService::cancelGsiInstall(bool* _aidl_return) {
     return binder::Status::ok();
 }
 
-binder::Status GsiService::getGsiBootStatus(int* _aidl_return) {
-    ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
-
-    if (!IsGsiInstalled()) {
-        *_aidl_return = BOOT_STATUS_NOT_INSTALLED;
-        return binder::Status::ok();
-    }
-
-    std::string boot_key;
-    if (!GetInstallStatus(&boot_key)) {
-        PLOG(ERROR) << "read " << kGsiInstallStatusFile;
-        *_aidl_return = BOOT_STATUS_NOT_INSTALLED;
-        return binder::Status::ok();
-    }
-
-    bool single_boot = !access(kGsiOneShotBootFile, F_OK);
-
-    if (boot_key == kInstallStatusWipe) {
-        // This overrides all other statuses.
-        *_aidl_return = BOOT_STATUS_WILL_WIPE;
-    } else if (boot_key == kInstallStatusDisabled) {
-        // A single-boot GSI will have a "disabled" status, because it's
-        // disabled immediately upon reading the one_shot_boot file. However,
-        // we still want to return SINGLE_BOOT, because it makes the
-        // transition clearer to the user.
-        if (single_boot) {
-            *_aidl_return = BOOT_STATUS_SINGLE_BOOT;
-        } else {
-            *_aidl_return = BOOT_STATUS_DISABLED;
-        }
-    } else if (single_boot) {
-        *_aidl_return = BOOT_STATUS_SINGLE_BOOT;
-    } else {
-        *_aidl_return = BOOT_STATUS_ENABLED;
-    }
-    return binder::Status::ok();
-}
-
-binder::Status GsiService::getUserdataImageSize(int64_t* _aidl_return) {
-    ENFORCE_SYSTEM;
-    std::lock_guard<std::mutex> guard(main_lock_);
-
-    *_aidl_return = -1;
-
-    if (installer_) {
-        // Size has already been computed.
-        *_aidl_return = installer_->userdata_size();
-    } else if (IsGsiRunning()) {
-        // :TODO: libdm
-        unique_fd fd(open(kUserdataDevice, O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-        if (fd < 0) {
-            PLOG(ERROR) << "open " << kUserdataDevice;
-            return binder::Status::ok();
-        }
-
-        int64_t size;
-        if (ioctl(fd, BLKGETSIZE64, &size)) {
-            PLOG(ERROR) << "BLKGETSIZE64 " << kUserdataDevice;
-            return binder::Status::ok();
-        }
-        *_aidl_return = size;
-    } else {
-        // Stat the size of the userdata file.
-        auto userdata_gsi = GetInstalledImagePath("userdata_gsi");
-        struct stat s;
-        if (stat(userdata_gsi.c_str(), &s)) {
-            if (errno != ENOENT) {
-                PLOG(ERROR) << "open " << userdata_gsi;
-                return binder::Status::ok();
-            }
-            *_aidl_return = 0;
-        } else {
-            *_aidl_return = s.st_size;
-        }
-    }
-    return binder::Status::ok();
-}
-
 binder::Status GsiService::getInstalledGsiImageDir(std::string* _aidl_return) {
     ENFORCE_SYSTEM;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     if (IsGsiInstalled()) {
         *_aidl_return = GetInstalledImageDir();
@@ -352,7 +299,7 @@ binder::Status GsiService::getInstalledGsiImageDir(std::string* _aidl_return) {
 
 binder::Status GsiService::wipeGsiUserdata(int* _aidl_return) {
     ENFORCE_SYSTEM_OR_SHELL;
-    std::lock_guard<std::mutex> guard(main_lock_);
+    std::lock_guard<std::mutex> guard(parent_->lock());
 
     if (IsGsiRunning() || !IsGsiInstalled()) {
         *_aidl_return = IGsiService::INSTALL_ERROR_GENERIC;
@@ -362,6 +309,143 @@ binder::Status GsiService::wipeGsiUserdata(int* _aidl_return) {
     auto installer = std::make_unique<GsiInstaller>(this, GetInstalledImageDir());
     *_aidl_return = installer->WipeUserdata();
 
+    return binder::Status::ok();
+}
+
+static binder::Status BinderError(const std::string& message) {
+    return binder::Status::fromExceptionCode(binder::Status::EX_SERVICE_SPECIFIC,
+                                             String8(message.c_str()));
+}
+
+static binder::Status UidSecurityError() {
+    uid_t uid = IPCThreadState::self()->getCallingUid();
+    auto message = StringPrintf("UID %d is not allowed", uid);
+    return binder::Status::fromExceptionCode(binder::Status::EX_SECURITY, String8(message.c_str()));
+}
+
+class ImageService : public BinderService<ImageService>, public BnImageService {
+  public:
+    ImageService(GsiService* service, std::unique_ptr<ImageManager>&& impl, uid_t uid);
+    binder::Status createBackingImage(const std::string& name, int64_t size, int flags) override;
+    binder::Status deleteBackingImage(const std::string& name) override;
+    binder::Status mapImageDevice(const std::string& name, int32_t timeout_ms,
+                                  MappedImage* mapping) override;
+    binder::Status unmapImageDevice(const std::string& name) override;
+    binder::Status backingImageExists(const std::string& name, bool* _aidl_return) override;
+    binder::Status isImageMapped(const std::string& name, bool* _aidl_return) override;
+
+  private:
+    bool CheckUid();
+
+    android::sp<GsiService> service_;
+    android::sp<Gsid> parent_;
+    std::unique_ptr<ImageManager> impl_;
+    uid_t uid_;
+};
+
+ImageService::ImageService(GsiService* service, std::unique_ptr<ImageManager>&& impl, uid_t uid)
+    : service_(service), parent_(service->parent()), impl_(std::move(impl)), uid_(uid) {}
+
+binder::Status ImageService::createBackingImage(const std::string& name, int64_t size, int flags) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    if (!impl_->CreateBackingImage(name, size, flags, nullptr)) {
+        return BinderError("Failed to create");
+    }
+    return binder::Status::ok();
+}
+
+binder::Status ImageService::deleteBackingImage(const std::string& name) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    if (!impl_->DeleteBackingImage(name)) {
+        return BinderError("Failed to delete");
+    }
+    return binder::Status::ok();
+}
+
+binder::Status ImageService::mapImageDevice(const std::string& name, int32_t timeout_ms,
+                                            MappedImage* mapping) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    if (!impl_->MapImageDevice(name, std::chrono::milliseconds(timeout_ms), &mapping->path)) {
+        return BinderError("Failed to map");
+    }
+    return binder::Status::ok();
+}
+
+binder::Status ImageService::unmapImageDevice(const std::string& name) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    if (!impl_->UnmapImageDevice(name)) {
+        return BinderError("Failed to unmap");
+    }
+    return binder::Status::ok();
+}
+
+binder::Status ImageService::backingImageExists(const std::string& name, bool* _aidl_return) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    *_aidl_return = impl_->BackingImageExists(name);
+    return binder::Status::ok();
+}
+
+binder::Status ImageService::isImageMapped(const std::string& name, bool* _aidl_return) {
+    if (!CheckUid()) return UidSecurityError();
+
+    std::lock_guard<std::mutex> guard(parent_->lock());
+
+    *_aidl_return = impl_->IsImageMapped(name);
+    return binder::Status::ok();
+}
+
+bool ImageService::CheckUid() {
+    return uid_ == IPCThreadState::self()->getCallingUid();
+}
+
+binder::Status GsiService::openImageService(const std::string& prefix,
+                                            android::sp<IImageService>* _aidl_return) {
+    static constexpr char kImageMetadataPrefix[] = "/metadata/gsi/";
+    static constexpr char kImageDataPrefix[] = "/data/gsi/";
+
+    auto in_metadata_dir = kImageMetadataPrefix + prefix;
+    auto in_data_dir = kImageDataPrefix + prefix;
+
+    std::string metadata_dir, data_dir;
+    if (!android::base::Realpath(in_metadata_dir, &metadata_dir)) {
+        PLOG(ERROR) << "realpath failed: " << metadata_dir;
+        return BinderError("Invalid path");
+    }
+    if (!android::base::Realpath(in_data_dir, &data_dir)) {
+        PLOG(ERROR) << "realpath failed: " << data_dir;
+        return BinderError("Invalid path");
+    }
+    if (!android::base::StartsWith(metadata_dir, kImageMetadataPrefix) ||
+        !android::base::StartsWith(data_dir, kImageDataPrefix)) {
+        return BinderError("Invalid path");
+    }
+
+    uid_t uid = IPCThreadState::self()->getCallingUid();
+    if (uid != AID_ROOT) {
+        return UidSecurityError();
+    }
+
+    auto impl = ImageManager::Open(metadata_dir, data_dir);
+    if (!impl) {
+        return BinderError("Unknown error");
+    }
+
+    *_aidl_return = new ImageService(this, std::move(impl), uid);
     return binder::Status::ok();
 }
 
@@ -377,9 +461,7 @@ binder::Status GsiService::CheckUid(AccessLevel level) {
             return binder::Status::ok();
         }
     }
-
-    auto message = StringPrintf("UID %d is not allowed", uid);
-    return binder::Status::fromExceptionCode(binder::Status::EX_SECURITY, String8(message.c_str()));
+    return UidSecurityError();
 }
 
 static bool IsExternalStoragePath(const std::string& path) {
@@ -405,7 +487,7 @@ int GsiService::ValidateInstallParams(GsiInstallParams* params) {
     // specifying the top-level folder, and then we choose the correct location
     // underneath.
     if (params->installDir.empty() || params->installDir == "/data/gsi") {
-        params->installDir = kDefaultGsiImageFolder;
+        params->installDir = kDefaultDsuImageFolder;
     }
 
     // Normalize the path and add a trailing slash.
@@ -414,8 +496,7 @@ int GsiService::ValidateInstallParams(GsiInstallParams* params) {
         PLOG(ERROR) << "realpath failed: " << origInstallDir;
         return INSTALL_ERROR_GENERIC;
     }
-    // Ensure the path ends in / for consistency. Even though GetImagePath()
-    // does this already, we want it to appear this way in install_dir.
+    // Ensure the path ends in / for consistency.
     if (!android::base::EndsWith(params->installDir, "/")) {
         params->installDir += "/";
     }
@@ -436,7 +517,7 @@ int GsiService::ValidateInstallParams(GsiInstallParams* params) {
             LOG(ERROR) << "cannot install GSIs to external media if verity uses check_at_most_once";
             return INSTALL_ERROR_GENERIC;
         }
-    } else if (params->installDir != kDefaultGsiImageFolder) {
+    } else if (params->installDir != kDefaultDsuImageFolder) {
         LOG(ERROR) << "cannot install GSI to " << params->installDir;
         return INSTALL_ERROR_GENERIC;
     }
@@ -453,26 +534,14 @@ int GsiService::ValidateInstallParams(GsiInstallParams* params) {
     return INSTALL_OK;
 }
 
-std::string GsiService::GetImagePath(const std::string& image_dir, const std::string& name) {
-    std::string dir = image_dir;
-    if (!android::base::EndsWith(dir, "/")) {
-        dir += "/";
-    }
-    return dir + name + ".img";
-}
-
 std::string GsiService::GetInstalledImageDir() {
     // If there's no install left, just return /data/gsi since that's where
     // installs go by default.
     std::string dir;
-    if (android::base::ReadFileToString(kGsiInstallDirFile, &dir)) {
+    if (android::base::ReadFileToString(kDsuInstallDirFile, &dir)) {
         return dir;
     }
-    return kDefaultGsiImageFolder;
-}
-
-std::string GsiService::GetInstalledImagePath(const std::string& name) {
-    return GetImagePath(GetInstalledImageDir(), name);
+    return kDefaultDsuImageFolder;
 }
 
 int GsiService::ReenableGsi(bool one_shot) {
@@ -483,7 +552,7 @@ int GsiService::ReenableGsi(bool one_shot) {
 
     std::string boot_key;
     if (!GetInstallStatus(&boot_key)) {
-        PLOG(ERROR) << "read " << kGsiInstallStatusFile;
+        PLOG(ERROR) << "read " << kDsuInstallStatusFile;
         return INSTALL_ERROR_GENERIC;
     }
     if (boot_key != kInstallStatusDisabled) {
@@ -497,24 +566,20 @@ int GsiService::ReenableGsi(bool one_shot) {
 
 bool GsiService::RemoveGsiFiles(const std::string& install_dir, bool wipeUserdata) {
     bool ok = true;
-    std::string message;
-    if (!SplitFiemap::RemoveSplitFiles(GetImagePath(install_dir, "system_gsi"), &message)) {
-        LOG(ERROR) << message;
-        ok = false;
-    }
-    if (wipeUserdata &&
-        !SplitFiemap::RemoveSplitFiles(GetImagePath(install_dir, "userdata_gsi"), &message)) {
-        LOG(ERROR) << message;
-        ok = false;
+    if (auto manager = ImageManager::Open(kDsuMetadataDir, install_dir)) {
+        ok &= manager->DeleteBackingImage("system_gsi");
+        if (wipeUserdata) {
+            ok &= manager->DeleteBackingImage("userdata_gsi");
+        }
     }
 
     std::vector<std::string> files{
-            kGsiInstallStatusFile,
-            kGsiLpMetadataFile,
-            kGsiOneShotBootFile,
-            kGsiInstallDirFile,
+            kDsuInstallStatusFile,
+            kDsuOneShotBootFile,
+            kDsuInstallDirFile,
     };
     for (const auto& file : files) {
+        std::string message;
         if (!android::base::RemoveFileIfExists(file, &message)) {
             LOG(ERROR) << message;
             ok = false;
@@ -546,7 +611,7 @@ void GsiService::RunStartupTasks() {
 
     std::string boot_key;
     if (!GetInstallStatus(&boot_key)) {
-        PLOG(ERROR) << "read " << kGsiInstallStatusFile;
+        PLOG(ERROR) << "read " << kDsuInstallStatusFile;
         return;
     }
 
@@ -562,8 +627,8 @@ void GsiService::RunStartupTasks() {
         int ignore;
         if (GetBootAttempts(boot_key, &ignore)) {
             // Mark the GSI as having successfully booted.
-            if (!android::base::WriteStringToFile(kInstallStatusOk, kGsiInstallStatusFile)) {
-                PLOG(ERROR) << "write " << kGsiInstallStatusFile;
+            if (!android::base::WriteStringToFile(kInstallStatusOk, kDsuInstallStatusFile)) {
+                PLOG(ERROR) << "write " << kDsuInstallStatusFile;
             }
         }
     }
