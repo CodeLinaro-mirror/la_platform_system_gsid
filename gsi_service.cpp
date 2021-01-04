@@ -32,6 +32,8 @@
 #include <android-base/strings.h>
 #include <android/gsi/BnImageService.h>
 #include <android/gsi/IGsiService.h>
+#include <android/os/IVold.h>
+#include <binder/IServiceManager.h>
 #include <binder/LazyServiceRegistrar.h>
 #include <ext4_utils/ext4_utils.h>
 #include <fs_mgr.h>
@@ -171,6 +173,18 @@ binder::Status GsiService::createPartition(const ::std::string& name, int64_t si
     if (size == 0 && name == "userdata") {
         size = kDefaultUserdataSize;
     }
+
+    if (name == "userdata") {
+        auto dsu_slot = GetDsuSlot(install_dir_);
+        auto key_dir = DefaultDsuMetadataKeyDir(dsu_slot);
+        auto key_dir_file = DsuMetadataKeyDirFile(dsu_slot);
+        if (!android::base::WriteStringToFile(key_dir, key_dir_file)) {
+            PLOG(ERROR) << "write failed: " << key_dir_file;
+            *_aidl_return = INSTALL_ERROR_GENERIC;
+            return binder::Status::ok();
+        }
+    }
+
     installer_ = std::make_unique<PartitionInstaller>(this, install_dir_, name,
                                                       GetDsuSlot(install_dir_), size, readOnly);
     progress_ = {};
@@ -179,6 +193,21 @@ binder::Status GsiService::createPartition(const ::std::string& name, int64_t si
         installer_ = nullptr;
     }
     *_aidl_return = status;
+    return binder::Status::ok();
+}
+
+binder::Status GsiService::closePartition(int32_t* _aidl_return) {
+    ENFORCE_SYSTEM;
+    std::lock_guard<std::mutex> guard(lock_);
+
+    if (installer_ == nullptr) {
+        LOG(ERROR) << "createPartition() has to be called before closePartition()";
+        *_aidl_return = IGsiService::INSTALL_ERROR_GENERIC;
+        return binder::Status::ok();
+    }
+    // It is important to not reset |installer_| here because other methods such
+    // as enableGsi() relies on the state of |installer_|.
+    *_aidl_return = installer_->FinishInstall();
     return binder::Status::ok();
 }
 
@@ -272,7 +301,13 @@ binder::Status GsiService::enableGsi(bool one_shot, const std::string& dsuSlot, 
     }
     if (installer_) {
         ENFORCE_SYSTEM;
+        int status = installer_->FinishInstall();
         installer_ = {};
+        if (status != IGsiService::INSTALL_OK) {
+            *_aidl_return = status;
+            LOG(ERROR) << "Installation failed, cannot enable DSU for slot: " << dsuSlot;
+            return binder::Status::ok();
+        }
         // Note: create the install status file last, since this is the actual boot
         // indicator.
         if (!SetBootMode(one_shot) || !CreateInstallStatusFile()) {
@@ -870,6 +905,10 @@ int GsiService::ReenableGsi(bool one_shot) {
     return IGsiService::INSTALL_OK;
 }
 
+static android::sp<android::os::IVold> GetVoldService() {
+    return android::waitForService<android::os::IVold>(android::String16("vold"));
+}
+
 bool GsiService::RemoveGsiFiles(const std::string& install_dir) {
     bool ok = true;
     auto active_dsu = GetDsuSlot(install_dir);
@@ -898,6 +937,22 @@ bool GsiService::RemoveGsiFiles(const std::string& install_dir) {
             LOG(ERROR) << message;
             ok = false;
         }
+    }
+    if (auto vold = GetVoldService()) {
+        auto status = vold->destroyDsuMetadataKey(dsu_slot);
+        if (status.isOk()) {
+            std::string message;
+            if (!RemoveFileIfExists(DsuMetadataKeyDirFile(dsu_slot), &message)) {
+                LOG(ERROR) << message;
+                ok = false;
+            }
+        } else {
+            LOG(ERROR) << "Failed to destroy DSU metadata encryption key.";
+            ok = false;
+        }
+    } else {
+        LOG(ERROR) << "Failed to retrieve vold service.";
+        ok = false;
     }
     if (ok) {
         SetProperty(kGsiInstalledProp, "0");
